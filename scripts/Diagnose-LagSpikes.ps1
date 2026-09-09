@@ -142,23 +142,48 @@ if ($upAdapters.Count -eq 0) {
 }
 
 # Mehrere Default-Routen gleichzeitig = Windows kann Traffic hin- und herschieben.
-$defaultRoutes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-                   Sort-Object RouteMetric)
-$routeIfIndexes = @($defaultRoutes | Select-Object -ExpandProperty InterfaceIndex -Unique)
+# Windows waehlt die Route mit der KLEINSTEN Summe aus Route- und
+# Interface-Metrik. Adapter, die nicht verbunden sind, koennen eine
+# verwaiste Standardroute hinterlassen - die zaehlt nicht mit.
+$defaultRoutes = @(
+    Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | ForEach-Object {
+        $ad = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue
+        [pscustomobject]@{
+            NextHop        = $_.NextHop
+            InterfaceIndex = $_.InterfaceIndex
+            GesamtMetrik   = $_.RouteMetric + $_.InterfaceMetric
+            Adapter        = $ad
+            IstVerbunden   = ($ad -and $ad.Status -eq 'Up')
+        }
+    } | Sort-Object @{ Expression = { -not $_.IstVerbunden } }, GesamtMetrik
+)
 
 Add-Report ''
 Add-Report 'Standardrouten (Weg ins Internet):'
 foreach ($r in $defaultRoutes) {
-    $ifName = (Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -ErrorAction SilentlyContinue).Name
-    Add-Report ("  - via {0,-16} ueber {1,-24} Metrik {2}" -f $r.NextHop, $ifName, ($r.RouteMetric + $r.InterfaceMetric))
+    Add-Report ("  - via {0,-16} ueber {1,-24} Metrik {2,-5} {3}" -f `
+        $r.NextHop, `
+        $(if ($r.Adapter) { $r.Adapter.Name } else { "Index $($r.InterfaceIndex)" }), `
+        $r.GesamtMetrik, `
+        $(if ($r.IstVerbunden) { 'verbunden' } else { 'NICHT verbunden (verwaiste Route)' }))
 }
 
-if ($routeIfIndexes.Count -gt 1) {
-    $baseFindings.Add('WICHTIG: Es sind mehrere Wege ins Internet gleichzeitig aktiv (z.B. LAN UND WLAN). Windows kann Verbindungen zwischen beiden umschalten - das erzeugt genau solche sporadischen Aussetzer. Deaktiviere den Adapter, den du nicht benutzt.') | Out-Null
+# Nur tatsaechlich verbundene Wege zaehlen fuer die Warnung.
+$liveRoutes     = @($defaultRoutes | Where-Object { $_.IstVerbunden })
+$liveIfIndexes  = @($liveRoutes | Select-Object -ExpandProperty InterfaceIndex -Unique)
+$staleRoutes    = @($defaultRoutes | Where-Object { -not $_.IstVerbunden })
+
+if ($liveIfIndexes.Count -gt 1) {
+    $baseFindings.Add('WICHTIG: Es sind mehrere Wege ins Internet gleichzeitig verbunden (z.B. LAN UND WLAN). Windows kann Verbindungen zwischen beiden umschalten - das erzeugt genau solche sporadischen Aussetzer. Deaktiviere den Adapter, den du nicht benutzt.') | Out-Null
+}
+if ($staleRoutes.Count -gt 0) {
+    Add-Report ''
+    Add-Report ("Hinweis: {0} verwaiste Standardroute(n) von nicht verbundenen Adaptern. Das ist normal und stoert den Datenverkehr nicht." -f $staleRoutes.Count) -Color DarkGray
 }
 
 # --- Gateway und Hop 2 ermitteln ----------------------------------------------
-$gateway = ($defaultRoutes | Select-Object -First 1).NextHop
+$gateway = @($defaultRoutes | Where-Object { $_.IstVerbunden } | Select-Object -First 1).NextHop
+if (-not $gateway) { $gateway = ($defaultRoutes | Select-Object -First 1).NextHop }
 if (-not $gateway -or $gateway -eq '0.0.0.0') { $gateway = $null }
 
 function Get-HopAddress {
@@ -213,8 +238,9 @@ if (-not $gateway) {
 }
 
 # --- Adapter, ueber den der Traffic laeuft ------------------------------------
-$activeIfIndex = ($defaultRoutes | Select-Object -First 1).InterfaceIndex
-$activeAdapter = Get-NetAdapter -InterfaceIndex $activeIfIndex -ErrorAction SilentlyContinue
+$activeRoute   = $defaultRoutes | Where-Object { $_.IstVerbunden } | Select-Object -First 1
+if (-not $activeRoute) { $activeRoute = $defaultRoutes | Select-Object -First 1 }
+$activeAdapter = $activeRoute.Adapter
 $isWifi = $false
 if ($activeAdapter) {
     $isWifi = ($activeAdapter.InterfaceDescription -match 'Wi-?Fi|Wireless|WLAN|802\.11') -or
@@ -434,7 +460,7 @@ try {
         } catch { }
 
         # --- Netzwerkdurchsatz ueber Delta der Adapterstatistik ---------------
-        $rxMbit = $null; $txMbit = $null
+        $rxMbit = $null; $txMbit = $null; $nicFehler = $null
         if ($activeAdapter) {
             try {
                 $st  = Get-NetAdapterStatistics -Name $activeAdapter.Name -ErrorAction Stop
@@ -447,6 +473,15 @@ try {
                         if ($rxMbit -lt 0) { $rxMbit = $null }
                         if ($txMbit -lt 0) { $txMbit = $null }
                     }
+                    # Fehlerhafte und verworfene Pakete sind der direkte
+                    # Nachweis fuer ein defektes Kabel, einen schlechten Port
+                    # oder eine gestoerte Funkstrecke. Auf einer gesunden
+                    # Leitung bleiben diese Zaehler bei exakt null.
+                    $e = 0
+                    foreach ($f in 'ReceivedPacketErrors','OutboundPacketErrors','ReceivedDiscardedPackets','OutboundDiscardedPackets') {
+                        if ($null -ne $st.$f -and $null -ne $prevStats.$f) { $e += ($st.$f - $prevStats.$f) }
+                    }
+                    if ($e -ge 0) { $nicFehler = $e }
                 }
                 $prevStats = $st; $prevStatsTime = $now
             } catch { }
@@ -477,7 +512,7 @@ try {
         $isSpike  = $gwSpike -or $h2Spike -or $netSpike
 
         $sample = [pscustomobject]@{
-            Zeit           = $tickStart.ToString('yyyy-MM-dd HH:mm:ss.fff')
+            Zeit           = $tickStart.ToString('yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture)
             GatewayMs      = $gwMs
             Hop2Ms         = $h2Ms
             InternetMs     = $netMs
@@ -487,6 +522,7 @@ try {
             DatentraegerQ  = $diskQ
             DownMbit       = $rxMbit
             UpMbit         = $txMbit
+            NicFehler      = $nicFehler
             WlanSignal     = $wifiSignal
             Spike          = $isSpike
         }
@@ -522,6 +558,7 @@ try {
                 DatentraegerQ = $diskQ
                 DownMbit      = $rxMbit
                 UpMbit        = $txMbit
+                NicFehler     = $nicFehler
                 WlanSignal    = $wifiSignal
                 TopProzesse   = $topProcs
             }
@@ -595,6 +632,46 @@ finally {
     }
     if ($gwLoss -gt 0 -or $netLoss -gt 0) {
         Add-Report ("  Paketverlust: Router {0}x, Internet {1}x" -f $gwLoss, $netLoss) -Color Yellow
+    }
+
+    # --- Fehlerhafte Pakete auf der Leitung ----------------------------------
+    $fehlerSumme = 0
+    $fehlerTicks = 0
+    foreach ($smp in $samples) {
+        if ($null -ne $smp.NicFehler -and $smp.NicFehler -gt 0) {
+            $fehlerSumme += [int]$smp.NicFehler
+            $fehlerTicks++
+        }
+    }
+    Add-Report ''
+    if ($fehlerSumme -gt 0) {
+        Add-Report ("Fehlerhafte/verworfene Pakete auf der Leitung: {0} in {1} Sekunden." -f $fehlerSumme, $fehlerTicks) -Color Yellow
+    } else {
+        Add-Report 'Fehlerhafte/verworfene Pakete auf der Leitung: keine.' -Color Green
+    }
+
+    # --- Zeitleiste: wann war es schlimm? ------------------------------------
+    # Macht Phasen sichtbar - z.B. unterschiedliche Spiele oder Programme.
+    if ($spikes.Count -gt 0 -and $durationSec -ge 180) {
+        # Balkenbreite so waehlen, dass rund 15 Zeilen entstehen - bei einer
+        # kurzen Messung feiner, bei einer langen groeber.
+        $eimerSek = [math]::Max(60, [math]::Ceiling($durationSec / 15 / 60) * 60)
+        Add-Report ''
+        Add-Report ("Zeitlicher Verlauf (Spikes je {0} Minute(n)):" -f ($eimerSek / 60))
+        $eimer = @{}
+        foreach ($sp in $spikes) {
+            $tt = [datetime]::ParseExact($sp.Zeit, 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture)
+            $k  = [int][math]::Floor(($tt - $startedAt).TotalSeconds / $eimerSek)
+            if ($eimer.ContainsKey($k)) { $eimer[$k]++ } else { $eimer[$k] = 1 }
+        }
+        $maxE = ($eimer.Values | Measure-Object -Maximum).Maximum
+        for ($k = 0; $k -le [int][math]::Floor($durationSec / $eimerSek); $k++) {
+            $n   = if ($eimer.ContainsKey($k)) { $eimer[$k] } else { 0 }
+            $bar = '#' * [int][math]::Round(($n / [math]::Max($maxE,1)) * 40)
+            Add-Report ("  {0}  {1,-40} {2}" -f $startedAt.AddSeconds($k*$eimerSek).ToString('HH:mm'), $bar, $n)
+        }
+        Add-Report '  Wenn sich die Spikes auf einzelne Abschnitte ballen, vergleiche das mit dem,'
+        Add-Report '  was zu der Zeit lief - das eingrenzende Programm steckt meist genau dort.'
     }
 
     # --- Zuordnung: wo faengt der Spike an? ----------------------------------
@@ -675,11 +752,21 @@ finally {
             }
         }
 
-        # Ort der Entstehung
-        if ($spLocal -gt 0 -and $spLocal -ge ($spikes.Count * 0.5)) {
+        # Fehlerhafte Pakete = harter Nachweis fuer eine kaputte Strecke
+        if ($fehlerSumme -gt 0) {
+            $verdicts.Add(("LEITUNG DEFEKT: Die Netzwerkkarte hat waehrend der Messung {0} fehlerhafte oder verworfene Pakete gezaehlt. Auf einer gesunden Verbindung ist dieser Wert exakt null. Per Kabel bedeutet das: anderes LAN-Kabel und anderer Router-Port, in dieser Reihenfolge. Per WLAN bedeutet es Funkstoerung oder zu schwaches Signal." -f $fehlerSumme)) | Out-Null
+        }
+
+        # Ort der Entstehung - nur aussagekraeftig, wenn der Router
+        # tatsaechlich auf Pings geantwortet hat. Ohne Hop-1-Messung waere
+        # jede Aussage "liegt nicht am PC" schlicht geraten.
+        if ($gwVals.Count -eq 0) {
+            $verdicts.Add('ORT NICHT BESTIMMBAR: Der eigene Router hat nicht auf Pings geantwortet. Deshalb laesst sich nicht sagen, ob die Spikes im PC oder erst dahinter entstehen. Aktiviere in der Router-Oberflaeche die Ping-Antwort (oft "ICMP" oder "Ping vom LAN beantworten") und miss erneut.') | Out-Null
+        }
+        elseif ($spLocal -gt 0 -and $spLocal -ge ($spikes.Count * 0.5)) {
             $verdicts.Add(("ORT: {0} von {1} Spikes treten schon auf dem Weg zum eigenen Router auf. Damit ist das Internet bzw. dein Provider ausgeschlossen - die Ursache liegt zwischen deinem PC und dem Router: Netzwerkkarte, Treiber, Energiesparen, Kabel/Port oder WLAN-Stoerung." -f $spLocal, $spikes.Count)) | Out-Null
         }
-        elseif (($spIsp + $spFar) -gt 0 -and ($spIsp + $spFar) -ge ($spikes.Count * 0.5)) {
+        elseif ($gwVals.Count -gt 0 -and ($spIsp + $spFar) -gt 0 -and ($spIsp + $spFar) -ge ($spikes.Count * 0.5)) {
             $verdicts.Add(("ORT: Der Ping zum eigenen Router bleibt bei den meisten Spikes sauber, erst dahinter wird es langsam. Die Ursache liegt also nicht am PC, sondern an Router, Leitung oder Provider. Auffaellig: seit gestern - das passt zu einer Stoerung am Anschluss. Router einmal fuer 5 Minuten stromlos machen und, wenn es bleibt, den Provider auf eine Leitungsstoerung ansprechen.")) | Out-Null
             if ($spFar -gt 0 -and $spIsp -eq 0 -and $h2Vals.Count -eq 0) {
                 $verdicts.Add('Hinweis: Hop 2 hat nicht auf Ping geantwortet, deshalb konnte "Provider" nicht sauber von "Internet" getrennt werden. Das ist normal und kein Fehler.') | Out-Null
@@ -688,7 +775,7 @@ finally {
 
         # Regelmaessigkeit -> deutet auf einen Timer/Dienst statt auf Zufall
         if ($spikes.Count -ge 4) {
-            $times = @($spikes | ForEach-Object { [datetime]::ParseExact($_.Zeit, 'yyyy-MM-dd HH:mm:ss.fff', $null) })
+            $times = @($spikes | ForEach-Object { [datetime]::ParseExact($_.Zeit, 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) })
             $gaps  = @()
             for ($i = 1; $i -lt $times.Count; $i++) { $gaps += ($times[$i] - $times[$i-1]).TotalSeconds }
             $gapMed = Get-Median ([double[]]$gaps)
@@ -698,6 +785,20 @@ finally {
             if ($tight -ge ($gaps.Count * 0.6) -and $gapMed -ge 5) {
                 $verdicts.Add(("REGELMASSIGES MUSTER: Die Spikes kommen in einem sehr gleichmaessigen Abstand von rund {0:0} Sekunden. Das ist kein Zufall, sondern ein Programm oder Dienst mit festem Intervall (z.B. WLAN-Kanalsuche, Backup, Cloud-Sync, Virenscanner, Update-Dienst). Die Aufgabenplanung und die Spalte TopProzesse in spikes.csv fuehren zum Verursacher." -f $gapMed)) | Out-Null
             }
+        }
+    }
+
+    # --- Ist schon der Weg zum eigenen Router zu langsam? --------------------
+    # Im gleichen Haus sollte der Router praktisch sofort antworten:
+    # per Kabel unter 1 ms, per WLAN wenige Millisekunden. Alles darueber
+    # ist bereits ein Defekt - voellig unabhaengig von einzelnen Spikes.
+    if ($gwVals.Count -ge 30) {
+        $gwMed   = Get-Median $gwVals
+        $grenze  = if ($isWifi) { 8 } else { 3 }
+        $medium  = if ($isWifi) { 'WLAN-Strecke' } else { 'LAN-Kabel' }
+        $erwartet= if ($isWifi) { 'wenige Millisekunden' } else { 'unter 1 ms' }
+        if ($gwMed -gt $grenze) {
+            $verdicts.Add(("STRECKE ZUM ROUTER: Schon im Normalbetrieb braucht dein eigener Router im Median {0:0.0} ms fuer eine Antwort. Erwartbar waeren ueber {1} {2}. Die Verbindung zwischen PC und Router ist damit dauerhaft gestoert, nicht nur bei den Spitzen - das erklaert Ruckler und Jitter in Spielen auch dann, wenn der Ping gerade nicht ausschlaegt." -f $gwMed, $medium, $erwartet)) | Out-Null
         }
     }
 
